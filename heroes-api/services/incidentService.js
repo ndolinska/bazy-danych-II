@@ -1,7 +1,8 @@
 const incidentRepository = require('../repositories/incidentRepository');
 const heroRepository = require('../repositories/heroRepository');
-const knex = require('../db/knex'); // Potrzebne tylko do inicjacji transakcji
+const { sequelize, Hero } = require('../models'); // Importujemy sequelize do transakcji i Hero do scope'ów
 
+// DTO musi obsłużyć zagnieżdżonego bohatera z Eager Loadingu
 const toDTO = (row) => ({
   id: row.id,
   location: row.location,
@@ -10,7 +11,14 @@ const toDTO = (row) => ({
   status: row.status,
   heroId: row.hero_id,
   assignedAt: row.assigned_at,
-  resolvedAt: row.resolved_at
+  resolvedAt: row.resolved_at,
+  // Zagnieżdżony bohater (jeśli został pobrany przez include)
+  hero: row.hero ? {
+    id: row.hero.id,
+    name: row.hero.name,
+    power: row.hero.power,
+    status: row.hero.status
+  } : null
 });
 
 const makeError = (message, code) => {
@@ -42,7 +50,6 @@ const findOne = async (id) => {
 };
 
 const getHeroIncidents = async (heroId, params) => {
-  // Wymóg: błąd 404 jeśli bohater nie istnieje
   const parsedHeroId = Number(heroId);
   const hero = await heroRepository.findOne(parsedHeroId);
   if (!hero) throw makeError('Hero not found', 'NOT_FOUND');
@@ -60,7 +67,6 @@ const getHeroIncidents = async (heroId, params) => {
 
 const create = async ({ location, district, level }) => {
   const allowedLevels = ['low', 'medium', 'critical'];
-
   if (!location?.trim()) throw makeError('Location is required', 'VALIDATION_ERROR');
   if (!allowedLevels.includes(level)) throw makeError('Invalid level', 'VALIDATION_ERROR');
 
@@ -68,51 +74,61 @@ const create = async ({ location, district, level }) => {
   return toDTO(row);
 };
 
+// --- TRANSAKCJE ZARZĄDZANE ---
+
 const assign = async (incidentId, heroId) => {
-  // Uruchamiamy transakcję na poziomie Serwisu
-  await knex.transaction(async (trx) => {
-    // Odczyty wewnątrz transakcji
-    const incident = await incidentRepository.findOne(incidentId, trx);
+  // Rozpoczynamy transakcję Sequelize
+  await sequelize.transaction(async (t) => {
+    // 1. Pobieramy incydent z blokadą pesymistyczną (lock: true)
+    const incident = await incidentRepository.findOne(incidentId, { transaction: t, lock: true });
     if (!incident) throw makeError('Incident not found', 'NOT_FOUND');
     if (incident.status !== 'open') throw makeError('Incident not open', 'CONFLICT');
 
-    const hero = await heroRepository.findOne(heroId, trx);
-    if (!hero) throw makeError('Hero not found', 'NOT_FOUND');
-    if (hero.status !== 'available') throw makeError('Hero busy', 'CONFLICT');
+    // 2. Pobieramy bohatera z użyciem wbudowanego SCOPE'a 'available'
+    // Zastępuje to ręczne pisanie where: { status: 'available' }
+    const hero = await Hero.scope('available').findByPk(heroId, { transaction: t, lock: true });
+    if (!hero) throw makeError('Hero not found or busy/retired', 'CONFLICT');
 
     if (incident.level === 'critical' && !['flight', 'strength'].includes(hero.power)) {
       throw makeError('Critical incidents require a hero with flight or strength power', 'FORBIDDEN');
     }
 
-    try {
-      // Przekazujemy obiekt trx w dół do repozytoriów!
-      await heroRepository.updateStatusStrict(heroId, 'available', 'busy', false, trx);
-      await incidentRepository.assignHeroStrict(incidentId, heroId, trx);
-    } catch (err) {
-      if (err.message.includes('CONCURRENCY')) throw makeError('Resource modified by another request', 'CONFLICT');
-      throw err; // Jeśli to inny błąd bazy, leci w górę i Knex robi automatyczny ROLLBACK
-    }
-  }); // Tu następuje automatyczny COMMIT
+    // 3. Aktualizujemy obiekty (dane zapisują się w bazie automatycznie dzięki .update())
+    await hero.update({ status: 'busy' }, { transaction: t });
+    
+    await incident.update({ 
+      status: 'assigned', 
+      hero_id: hero.id, 
+      assigned_at: new Date() 
+    }, { transaction: t });
+    
+    // Brak ręcznego t.commit()! Jeśli kod dotrze tutaj, Sequelize samo zrobi COMMIT.
+  }); 
 };
 
 const resolve = async (incidentId) => {
-  await knex.transaction(async (trx) => {
-    const incident = await incidentRepository.findOne(incidentId, trx);
+  await sequelize.transaction(async (t) => {
+    const incident = await incidentRepository.findOne(incidentId, { transaction: t, lock: true });
     if (!incident) throw makeError('Incident not found', 'NOT_FOUND');
     if (incident.status !== 'assigned') throw makeError('Only assigned incidents can be resolved', 'VALIDATION_ERROR');
 
-    try {
-      // Bohater wraca na available, a jego missions_count rośnie o 1
-      await heroRepository.updateStatusStrict(incident.hero_id, 'busy', 'available', true, trx);
-      await incidentRepository.resolveIncidentStrict(incidentId, trx);
-    } catch (err) {
-      if (err.message.includes('CONCURRENCY')) throw makeError('Resource modified by another request', 'CONFLICT');
-      throw err;
+    const hero = await heroRepository.findOne(incident.hero_id, { transaction: t, lock: true });
+    if (hero) {
+      await hero.update({ status: 'available' }, { transaction: t });
     }
+
+    // Aktualizacja incydentu. 
+    // UWAGA: To wywoła hook afterUpdate na modelu Incident, 
+    // który automatycznie zwiększy missions_count bohatera w tej samej transakcji!
+    await incident.update({ 
+      status: 'resolved', 
+      resolved_at: new Date() 
+    }, { transaction: t });
   });
 };
 
 const getStats = async () => {
+  // Statystyki również formatujemy, tak samo jak wcześniej
   const data = await incidentRepository.getSystemStats();
 
   const formatGroup = (arr, keyName) => {
